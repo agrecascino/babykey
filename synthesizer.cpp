@@ -7,39 +7,108 @@
 #include <X11/Xlib.h>
 #include <cstring>
 #include <fstream>
+#include <sys/soundcard.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <portmidi.h>
+#include <porttime.h>
+#include <vector>
 using namespace std;
 //import player;
 
+float simplp (float *x, float *y,
+              int M, float xm1)
+{
+    int n;
+    y[0] = x[0] + xm1;
+    for (n=1; n < M ; n++) {
+        y[n] =  x[n]  + x[n-1];
+    }
+    return x[M-1];
+}
+
 struct NoteVoice {
-    float volume = 0.0f;
-    float pitch;
-    float time = 0.0f;
-    bool pressed = false;
-    void reset(){
+    double volume = 0.0f;
+    double pitch;
+    double time = 0.0f;
+    int pressed = false;
+    float velocity = 0.0f;
+    float time_released = 0.0f;
+    float time_at_release = 0.0f;
+    void reset(float velocity_initial = 1.0f){
         pressed = true;
         time = 0.0f;
-        volume = 0.125f;
+        time_at_release = 0.0f;
+        time_released = 0.0f;
+        //nominally 0.125f at highest
+        velocity = velocity_initial/8.0f;
+        volume = velocity;
     }
     void release() {
         pressed = false;
         //volume = 0.0f;
     }
-    float simulate(float samplerate) {
+
+    double interval_stack(int stack, double interval, double pitch, double time) {
+        double ret = 0.0;
+        for(int i = 0; i < stack; i++) {
+            double x = pow(2,i+1);
+            ret += voice(pitch*x*interval, time)/x;
+        }
+        return ret;
+    }
+    double triangle(double ptc) {
+        double pt = fmod(ptc, 2 * M_PI);
+        if(pt < (M_PI/2.0f)){
+            return (2.0f * pt)/M_PI;
+        } else if(pt < (3 * (M_PI/2.0f))) {
+            return 2.0f - (2.0f * pt)/M_PI;
+        } else {
+            return -4.0f + (2.0f * pt)/M_PI;
+        }
+    }
+
+    double sinmod(double ptc) {
+        return sqrtf(sinf(ptc)+1)-1;
+    }
+
+    double square(double ptc) {
+        double pt = fmod(ptc, 2 * M_PI);
+        if(pt < M_PI/3.0f) {
+            return 1.0f;
+        }
+        return 0.0f;
+    }
+
+    double voice(double pitchc, double time) {
+        return square(2 * M_PI * pitchc * time);
+
+    }
+// #define CURVE_LINEAR
+#define CURVE_EXP
+    double simulate(double samplerate) {
         if(round(volume*16777216) < 1.0f)
             return 0.0f;
-        if(!pressed)
+        if(!pressed) {
+            if(time_at_release  == 0.0f) {
+                time_at_release = time;
+            }
+            time_released = time - time_at_release;
+#ifdef CURVE_LINEAR
             volume = (volume - (0.1f/samplerate));
+#endif
+#ifdef CURVE_EXP
+            float ramp = pow(M_E, -time_released);
+            volume = velocity*ramp;
+#endif
+        }
         if(volume < 0.001f){
             volume = 0.0f;
         }
-        float pitchc = pitch + 0.025*pitch*sin(time);
+        double pitchc = pitch;
         time += 1.0f/samplerate;
-        float sample = (
-                    (sinf(2 * M_PI * pitchc * time)) +
-                    (sinf(M_PI * pitchc * time)/6.0f) +
-                    (sinf(2 * M_PI * pitchc * time * (3/2.0f))/12.0f) +
-                    (sinf(2 * M_PI * pitchc * time * (5/2.0f))/7.0f)
-                    ) * volume * min(time*10, 1.0f);
+        double sample = (voice(pitchc, time)/8.0f + interval_stack(6, 1, pitchc, time)/8.0f + interval_stack(3, 3.0f, pitchc, time)/8.0f) * volume * min(time*10, 1.0);
         return sample;
     }
 };
@@ -48,14 +117,13 @@ struct Syntheizer {
     struct NoteVoice keys[88];
     Syntheizer(){
         for(int i = 0; i < 88; i++){
-            keys[i].pitch = 27.5f * pow(2.0f, i/12.0f);
+            keys[i].pitch = 27.5f  * pow(2.0f, i/12.0f);
         }
     }
-    float cframe(float samplerate) {
-        float res = 0.0f;
+    double cframe(double samplerate) {
+        double res = 0.0f;
         for(int i = 0; i < 88; i++){
-            res += keys[i].simulate(samplerate);
-        }
+            res += keys[i].simulate(samplerate);        }
         return res;
     }
 };
@@ -71,10 +139,14 @@ enum KeyType {
     BlackKey
 };
 struct Keyboard {
-    Keyboard() {
+    Keyboard(int verb_len) {
+        reverb_pt = 0;
+        for(int i = 0; i < verb_len; i++)
+            reverb_buf.push_back(0);
         memset(key2note, 255, 256);
         Pa_OpenDefaultStream(&stream, 0, 1, paFloat32, 44100, 2048, paCallback, this);
         Pa_StartStream(stream);
+        Pm_OpenInput(&midistream, Pm_GetDefaultInputDeviceID(), NULL, 64, NULL, NULL);
         display = XOpenDisplay(NULL);
         screen = DefaultScreen(display);
         screen_cmap = DefaultColormap(display, DefaultScreen(display));
@@ -84,7 +156,7 @@ struct Keyboard {
         XAllocColor(display, screen_cmap, &Wheat);
         XLookupColor(display, screen_cmap, "Cornflower Blue", &Cornflower_Blue, &Cornflower_Blue);
         XAllocColor(display, screen_cmap, &Cornflower_Blue);
-        window = XCreateSimpleWindow(display, RootWindow(display, screen), 10, 10, 840, 300, 1,
+        window = XCreateSimpleWindow(display, RootWindow(display, screen), 10, 10, 840*2, 300, 1,
                                      BlackPixel(display, screen), Wheat.pixel);
         XSelectInput(display, window, KeyPressMask | KeyReleaseMask | ExposureMask);
         XMapWindow(display, window);
@@ -100,7 +172,7 @@ struct Keyboard {
         key2note[53] = 17 + 12;
         key2note[54] = 19 + 12;
         key2note[55] = 20 + 12;
-        key2note[56] = 22 + 12;
+        key2note[56] = 12 + 12;
         key2note[57] = 24 + 12;
         key2note[58] = 26 + 12;
         key2note[24] = 27 + 12;
@@ -130,7 +202,7 @@ struct Keyboard {
     void draw_keyboard() {
         int nw = 0;
         int nb = 0;
-        for(int i = 0; i < 24; i++) {
+        for(int i = 0; i < 44; i++) {
             if(keys[i] == WhiteKey) {
 
                 if(!s.keys[27+i].pressed)
@@ -153,18 +225,51 @@ struct Keyboard {
         }
     }
 
+
     void synthesize(float *obuffer) {
         //std::mutex mtx;
         //mtx.lock();
-        for(int i = 0;i < 2048; i++)
-            obuffer[i] = s.cframe(44100);
+        float o2[2048];
+        int verb_len = reverb_buf.size();
+        for(int i = 0;i < 2048; i++) {
+            reverb_pt = reverb_pt % verb_len;
+            o2[i] = s.cframe(44100) + reverb_buf[reverb_pt % verb_len]*0.35f;
+            reverb_buf[reverb_pt % verb_len] = o2[i];
+            reverb_pt++;
+        }
+        simplp(o2, obuffer, 2048, o2[0]);
         //mtx.unlock();
     }
     uint16_t period2note[36] = { 856, 808, 762, 720, 678, 640, 604, 570, 538, 508, 480, 453,
-                                 428, 404, 381, 360, 339, 320, 302, 285, 269, 254, 240, 226,
+                                 428, 404, 381, 360, 339, 320, 302, 285, 269, 254, 240, 126,
                                  214, 202, 190, 180, 170, 160, 151, 143, 135, 127, 120, 113
                                };
     uint8_t key2note[256];
+
+    void process_midi() {
+        while(true) {
+            PmEvent buffer;
+            Pm_Read(midistream, &buffer, 1);
+            unsigned char midi[4];
+            memset(midi, 0 , 4);
+            midi[0] = Pm_MessageStatus(buffer.message);
+            midi[1] = Pm_MessageData1(buffer.message);
+            midi[2] = Pm_MessageData2(buffer.message);
+            switch(midi[0] >> 4) {
+                case 0x9:
+                    if(midi[2] == 0x00) {
+                        s.keys[midi[1]].release();
+                        break;
+                    }
+                    if(!s.keys[midi[1]].pressed)
+                        s.keys[midi[1]].reset(midi[2]/127.0f);
+                    break;
+                case 0x8:
+                    s.keys[midi[1]].release();
+                    break;
+            }
+        }
+    }
 
     /*void process_module_notes() {
         std::fstream f("love.mod");
@@ -228,6 +333,8 @@ nextorder:
     }*/
 
     void event_loop() {
+        std::thread t(std::bind(&Keyboard::process_midi, this));
+        t.detach();
         //std::thread t(std::bind(&Keyboard::process_module_notes, this));
         //t.detach();
         while(true) {
@@ -256,9 +363,12 @@ nothing2do:
             XFlushGC(display, gc);
         }
     }
+    int reverb_pt;
+    std::vector<float> reverb_buf;
     GC gc;
     int screen;
     PaStream *stream;
+    PmStream *midistream;
     Syntheizer s;
     Display *display;
     Window window;
@@ -285,9 +395,11 @@ static int paCallback( const void *inputBuffer, void *outputBuffer,
 
 int main()
 {
+    Pm_Initialize();
+    Pt_Start(1, NULL, NULL);
     srand(time(NULL));
     Pa_Initialize();
-    Keyboard k;
+    Keyboard k(1);
     k.event_loop();
     return 0;
 }

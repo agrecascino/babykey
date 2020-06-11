@@ -6,8 +6,8 @@ CONFIG -= qt
 SOURCES += \
     synthesizer.cpp
 
-LIBS += -lportaudio -lpthread -lX11
+LIBS += -lportaudio -lpthread -lX11 -lasound -lportmidi
 
-QMAKE_CXXFLAGS +=  -std=c++2a -fmodules-ts
+QMAKE_CXXFLAGS +=  -std=c++17 -fmodules
 
 
