@@ -8,6 +8,6 @@ SOURCES += \
 
 LIBS += -lportaudio -lpthread -lX11 -lasound -lportmidi
 
-QMAKE_CXXFLAGS +=  -std=c++17 -fmodules
+QMAKE_CXXFLAGS +=  -std=c++17
 
 

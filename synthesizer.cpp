@@ -14,6 +14,7 @@
 #include <portmidi.h>
 #include <porttime.h>
 #include <vector>
+#include <queue>
 using namespace std;
 //import player;
 
@@ -36,6 +37,7 @@ struct NoteVoice {
     float velocity = 0.0f;
     float time_released = 0.0f;
     float time_at_release = 0.0f;
+    std::queue<float> delayline;
     void reset(float velocity_initial = 1.0f){
         pressed = true;
         time = 0.0f;
@@ -80,13 +82,25 @@ struct NoteVoice {
         }
         return 0.0f;
     }
+    double noise() {
+        return ((rand() % 256) - 127)/127.0f;
+    }
 
     double voice(double pitchc, double time) {
-        return square(2 * M_PI * pitchc * time);
+        float yeah = noise();
+        delayline.push(yeah);
+        float front = delayline.front();
+        if(delayline.size() > 44100/pitchc) {
+            delayline.pop();
+            float newcool = (front + delayline.front()) * 0.5f * 0.2f;
+            delayline.push(newcool);
+            return newcool;
+        }
+        return yeah;
 
     }
-// #define CURVE_LINEAR
-#define CURVE_EXP
+    // #define CURVE_LINEAR
+//#define CURVE_EXP
     double simulate(double samplerate) {
         if(round(volume*16777216) < 1.0f)
             return 0.0f;
@@ -108,7 +122,8 @@ struct NoteVoice {
         }
         double pitchc = pitch;
         time += 1.0f/samplerate;
-        double sample = (voice(pitchc, time)/8.0f + interval_stack(6, 1, pitchc, time)/8.0f + interval_stack(3, 3.0f, pitchc, time)/8.0f) * volume * min(time*10, 1.0);
+        double sample = voice(pitchc, time)/16.0f;
+        //double sample = (voice(pitchc, time)/8.0f + interval_stack(6, 1, pitchc, time)/8.0f + interval_stack(3, 3.0f, pitchc, time)/8.0f) * volume * min(time*10, 1.0);
         return sample;
     }
 };
